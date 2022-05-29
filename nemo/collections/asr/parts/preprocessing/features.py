@@ -35,9 +35,10 @@
 import math
 import random
 
-import librosa
+# import librosa
 import torch
 import torch.nn as nn
+import torchaudio.functional as F
 
 from nemo.collections.asr.parts.preprocessing.perturb import AudioAugmentor
 from nemo.collections.asr.parts.preprocessing.segment import AudioSegment
@@ -235,10 +236,13 @@ class FilterbankFeatures(nn.Module):
         self.pad_to = pad_to
         highfreq = highfreq or sample_rate / 2
 
-        filterbanks = torch.tensor(
-            librosa.filters.mel(sr=sample_rate, n_fft=self.n_fft, n_mels=nfilt, fmin=lowfreq, fmax=highfreq),
-            dtype=torch.float,
-        ).unsqueeze(0)
+        # filterbanks = torch.tensor(
+        #     librosa.filters.mel(sr=sample_rate, n_fft=self.n_fft, n_mels=nfilt, fmin=lowfreq, fmax=highfreq),
+        #     dtype=torch.float,
+        # ).unsqueeze(0)
+        filterbanks = F.melscale_fbanks(
+            sample_rate=sample_rate, n_freqs=int(self.n_fft // 2 + 1), n_mels=nfilt, f_min=lowfreq, f_max=highfreq,
+        ).T.unsqueeze(0)
         self.register_buffer("fb", filterbanks)
 
         # Calculate maximum sequence length
