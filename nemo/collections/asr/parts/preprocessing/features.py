@@ -34,6 +34,7 @@
 # This file contains code artifacts adapted from https://github.com/ryanleary/patter
 import math
 import random
+from typing import Dict, Union
 
 # import librosa
 import torch
@@ -217,6 +218,8 @@ class FilterbankFeatures(nn.Module):
         window_fn = torch_windows.get(window, None)
         window_tensor = window_fn(self.win_length, periodic=False) if window_fn else None
         self.register_buffer("window", window_tensor)
+        self.exact_pad = exact_pad
+        self._constant = CONSTANT
         self.stft = lambda x: torch.stft(
             x,
             n_fft=self.n_fft,
@@ -269,8 +272,9 @@ class FilterbankFeatures(nn.Module):
         if self.nb_augmentation_prob > 0.0:
             if nb_max_freq >= sample_rate / 2:
                 self.nb_augmentation_prob = 0.0
-            else:
-                self._nb_max_fft_bin = int((nb_max_freq / sample_rate) * n_fft)
+            # else:
+            #     self._nb_max_fft_bin = int((nb_max_freq / sample_rate) * n_fft)
+        self._nb_max_fft_bin = int((nb_max_freq / sample_rate) * n_fft)
 
         # log_zero_guard_value is the the small we want to use, we support
         # an actual number, or "tiny", or "eps"
@@ -310,6 +314,51 @@ class FilterbankFeatures(nn.Module):
     def filter_banks(self):
         return self.fb
 
+    def normalize_batch(self, x: torch.Tensor, seq_len: torch.Tensor, normalize_type: str):
+        if normalize_type == "per_feature":
+            x_mean = torch.zeros((seq_len.shape[0], x.shape[1]), dtype=x.dtype, device=x.device)
+            x_std = torch.zeros((seq_len.shape[0], x.shape[1]), dtype=x.dtype, device=x.device)
+            for i in range(x.shape[0]):
+                if x[i, :, : seq_len[i]].shape[1] == 1:
+                    raise ValueError(
+                        "normalize_batch with `per_feature` normalize_type received a tensor of length 1. This will result "
+                        "in torch.std() returning nan"
+                    )
+                x_mean[i, :] = x[i, :, : seq_len[i]].mean(dim=1)
+                x_std[i, :] = x[i, :, : seq_len[i]].std(dim=1)
+            # make sure x_std is not zero
+            # x_std += CONSTANT
+            x_std += self._constant
+            return (x - x_mean.unsqueeze(2)) / x_std.unsqueeze(2)
+        elif normalize_type == "all_features":
+            x_mean = torch.zeros(seq_len.shape, dtype=x.dtype, device=x.device)
+            x_std = torch.zeros(seq_len.shape, dtype=x.dtype, device=x.device)
+            for i in range(x.shape[0]):
+                x_mean[i] = x[i, :, : seq_len[i].item()].mean()
+                x_std[i] = x[i, :, : seq_len[i].item()].std()
+            # make sure x_std is not zero
+            # x_std += CONSTANT
+            x_std += self._constant
+            return (x - x_mean.view(-1, 1, 1)) / x_std.view(-1, 1, 1)
+        # elif "fixed_mean" in normalize_type and "fixed_std" in normalize_type:
+        #     x_mean = torch.tensor(normalize_type["fixed_mean"], device=x.device)
+        #     x_std = torch.tensor(normalize_type["fixed_std"], device=x.device)
+        #     return (x - x_mean.view(x.shape[0], x.shape[1]).unsqueeze(2)) / x_std.view(x.shape[0], x.shape[1]).unsqueeze(2)
+        else:
+            return x
+
+    def splice_frames(self, x: torch.Tensor, frame_splicing: int):
+        """ Stacks frames together across feature dim
+
+        input is batch_size, feature_dim, num_frames
+        output is batch_size, feature_dim*frame_splicing, num_frames
+
+        """
+        seq = [x]
+        for n in range(1, frame_splicing):
+            seq.append(torch.cat([x[:, :, :n], x[:, :, n:]], dim=2))
+        return torch.cat(seq, dim=1)
+
     def forward(self, x, seq_len):
         seq_len = self.get_seq_len(seq_len.float())
 
@@ -327,19 +376,31 @@ class FilterbankFeatures(nn.Module):
             x = torch.cat((x[:, 0].unsqueeze(1), x[:, 1:] - self.preemph * x[:, :-1]), dim=1)
 
         # disable autocast to get full range of stft values
-        with torch.cuda.amp.autocast(enabled=False):
-            x = self.stft(x)
+        # with torch.cuda.amp.autocast(enabled=False):
+            # x = self.stft(x)
+        ## MSIS: the above autocast messes up the mobile export.
+        x = torch.stft(
+            x,
+            n_fft=self.n_fft,
+            hop_length=self.hop_length,
+            win_length=self.win_length,
+            center=False if self.exact_pad else True,
+            window=self.window.to(dtype=torch.float),
+            return_complex=False,
+        )
 
         # torch returns real, imag; so convert to magnitude
         # guard is needed for sqrt if grads are passed through
-        guard = 0 if not self.use_grads else CONSTANT
+        # guard = 0 if not self.use_grads else CONSTANT
+        guard = 0.0 if not self.use_grads else self._constant
         if x.dtype in [torch.cfloat, torch.cdouble]:
             x = torch.view_as_real(x)
         x = torch.sqrt(x.pow(2).sum(-1) + guard)
 
         if self.training and self.nb_augmentation_prob > 0.0:
             for idx in range(x.shape[0]):
-                if self._rng.random() < self.nb_augmentation_prob:
+                # if self._rng.random() < self.nb_augmentation_prob:
+                if torch.rand((1)) < self.nb_augmentation_prob:
                     x[idx, self._nb_max_fft_bin :, :] = 0.0
 
         # get power spectrum
@@ -360,11 +421,13 @@ class FilterbankFeatures(nn.Module):
 
         # frame splicing if required
         if self.frame_splicing > 1:
-            x = splice_frames(x, self.frame_splicing)
+            # x = splice_frames(x, self.frame_splicing)
+            x = self.splice_frames(x, self.frame_splicing)
 
         # normalize if required
         if self.normalize:
-            x = normalize_batch(x, seq_len, normalize_type=self.normalize)
+            # x = normalize_batch(x, seq_len, normalize_type=self.normalize)
+            x = self.normalize_batch(x, seq_len, normalize_type=self.normalize)
 
         # mask to zero any values beyond seq_len in batch, pad to multiple of `pad_to` (for efficiency)
         max_len = x.size(-1)
@@ -373,11 +436,16 @@ class FilterbankFeatures(nn.Module):
         x = x.masked_fill(mask.unsqueeze(1).type(torch.bool).to(device=x.device), self.pad_value)
         del mask
         pad_to = self.pad_to
-        if pad_to == "max":
-            x = nn.functional.pad(x, (0, self.max_length - x.size(-1)), value=self.pad_value)
-        elif pad_to > 0:
+        # if pad_to == "max":
+        #     x = nn.functional.pad(x, (0, self.max_length - x.size(-1)), value=self.pad_value)
+        # elif pad_to > 0:
+        #     pad_amt = x.size(-1) % pad_to
+        #     if pad_amt != 0:
+        #         x = nn.functional.pad(x, (0, pad_to - pad_amt), value=self.pad_value)
+        if pad_to > 0:
             pad_amt = x.size(-1) % pad_to
             if pad_amt != 0:
-                x = nn.functional.pad(x, (0, pad_to - pad_amt), value=self.pad_value)
+                # x = nn.functional.pad(x, (0, pad_to - pad_amt), value=self.pad_value)
+                x = torch.nn.functional.pad(x, (0, pad_to - pad_amt), value=float(self.pad_value))
 
         return x, seq_len
